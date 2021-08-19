@@ -100,7 +100,8 @@ type mapextra struct {
 
 ```
 
-![image-20210819122201016](/Users/liuyangyang/Library/Application Support/typora-user-images/image-20210819122201016.png)
+![image-20210819122201016](/Users/liuyangyang/刘阳阳/2021-interview/images/golang-map-mapstruct.png)
+![golang-map-mapstruct](https://github.com/lauyounger/prepareForInterview/blob/main/images/golang-map-mapstruct.png)
 
 ###### 扩容机制
 
