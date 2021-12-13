@@ -1,0 +1,39 @@
+### Redis的主从如何保证数据一致性
+
+#### 主从首次同步
+
+![redis主从首次复制](/Users/liuyangyang/刘阳阳/2021-interview/images/redis主从首次复制.jpg)
+
+从库使用replicaof ip port从主库同步数据，主从建立长链接，从库发送psync命令给主库，表示需要同步数据，psync 命令包含了主库的 runID 和复制进度 offset 两个参数。
+runID：每个redis实例的唯一标识
+offset：从库同步的偏移量，复制进度。首次为-1。
+
+首次同步采用全量同步FULLRESYNC的策略，redis使用bgsave命令，后台生成RDB文件。发送给从库。从库清空当前数据，加载RDB文件，对于同步期间的写操作，主库会写到一个replication buffer的内存空间中。从库加载完成RDB文件后，主库根据从库记录的偏移点，继续同步replication buffer中的数据。完成首次同步。后续的同步会通过长链接传输数据。
+
+### 从库断连重连后的数据恢复
+
+从库因为某些原因断连后，如何同步主库的数据呢？
+
+首先引入两个概念：repl_backlog_buffer和slave_backlog_buffer。
+
+repl_backlog_buffer：记录在主库的环形buffer，主要记载当前主库的写入点和从库的读取点。
+
+slave_repl_offset：从库记录在本地实例的数据同步点。
+
+有一个地方要强调一下，因为 repl_backlog_buffer 是一个环形缓冲区，所以在缓冲区写满后，主库会继续写入，此时，就会覆盖掉之前写入的操作。如果从库的读取速度比较慢，就有可能导致从库还未读取的操作被主库新写的操作覆盖了，这会导致主从库间的数据不一致。所以我们需要调节repl_backlog_size的大小，调节微缓冲空间的2倍，尽量保证不会出现数据不一致的问题。否则还会进行全量同步。
+
+重点：
+
+1. 一个从库如果和主库断连时间过长，造成它在主库repl_backlog_buffer的slave_repl_offset位置上的数据已经被覆盖掉了，此时从库和主库间将进行全量复制。
+
+2. 每个从库会记录自己的slave_repl_offset，每个从库的复制进度也不一定相同。在和主库重连进行恢复时，从库会通过psync命令把自己记录的slave_repl_offset发给主库，主库会根据从库各自的复制进度，来决定这个从库可以进行增量复制，还是全量复制。
+
+2、应该不是“主从库断连后”主库才把写操作写入repl_backlog_buffer，只要有从库存在，这个repl_backlog_buffer就会存在。主库的所有写命令除了传播给从库之外，都会在这个repl_backlog_buffer中记录一份，缓存起来，只有预先缓存了这些命令，当从库断连后，从库重新发送psync $master_runid $offset，主库才能通过$offset在repl_backlog_buffer中找到从库断开的位置，只发送$offset之后的增量数据给从库即可。
+
+有同学对repl_backlog_buffer和replication buffer理解比较混淆，我大概解释一下：
+
+1、repl_backlog_buffer：就是上面我解释到的，它是为了从库断开之后，如何找到主从差异数据而设计的环形缓冲区，从而避免全量同步带来的性能开销。如果从库断开时间太久，repl_backlog_buffer环形缓冲区被主库的写命令覆盖了，那么从库连上主库后只能乖乖地进行一次全量同步，所以repl_backlog_buffer配置尽量大一些，可以降低主从断开后全量同步的概率。而在repl_backlog_buffer中找主从差异的数据后，如何发给从库呢？这就用到了replication buffer。
+
+2、replication buffer：Redis和客户端通信也好，和从库通信也好，Redis都需要给分配一个 内存buffer进行数据交互，客户端是一个client，从库也是一个client，我们每个client连上Redis后，Redis都会分配一个client buffer，所有数据交互都是通过这个buffer进行的：Redis先把数据写到这个buffer中，然后再把buffer中的数据发到client socket中再通过网络发送出去，这样就完成了数据交互。所以主从在增量同步时，从库作为一个client，也会分配一个buffer，只不过这个buffer专门用来传播用户的写命令到从库，保证主从数据一致，我们通常把它叫做replication buffer。另外：多个从库会维护多个replication buffer。每个从库，master都会有一个replication_buffer,但是只有一个replic_backlog_buffer所有salve共享
+
+3、再延伸一下，既然有这个内存buffer存在，那么这个buffer有没有限制呢？如果主从在传播命令时，因为某些原因从库处理得非常慢，那么主库上的这个buffer就会持续增长，消耗大量的内存资源，甚至OOM。所以Redis提供了client-output-buffer-limit参数限制这个buffer的大小，如果超过限制，主库会强制断开这个client的连接，也就是说从库处理慢导致主库内存buffer的积压达到限制后，主库会强制断开从库的连接，此时主从复制会中断，中断后如果从库再次发起复制请求，那么此时可能会导致恶性循环，引发复制风暴，这种情况需要格外注意。
